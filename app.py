@@ -152,11 +152,37 @@ def ensure_file(path: Path):
 
 
 def read_table(path: Path) -> pd.DataFrame:
+    """
+    Read CSV/Excel safely. Some files exported from Excel contain degree symbols
+    in Latitude/Longitude and are saved as Windows/Latin encoding, not UTF-8.
+    This fallback prevents UnicodeDecodeError on Streamlit Cloud.
+    """
     ensure_file(path)
     suffix = path.suffix.lower()
+
     if suffix in [".xlsx", ".xls"]:
         return pd.read_excel(path)
-    return pd.read_csv(path)
+
+    encodings_to_try = ["utf-8", "utf-8-sig", "cp1252", "ISO-8859-1", "latin1"]
+    last_error = None
+
+    for enc in encodings_to_try:
+        try:
+            return pd.read_csv(path, encoding=enc)
+        except UnicodeDecodeError as e:
+            last_error = e
+        except Exception as e:
+            # Try Python engine once for mildly irregular CSV files.
+            try:
+                return pd.read_csv(path, encoding=enc, engine="python")
+            except Exception:
+                last_error = e
+
+    st.error(
+        f"Could not read {path.name}. Please save it again as CSV UTF-8 or Excel .xlsx. "
+        f"Last error: {last_error}"
+    )
+    st.stop()
 
 
 def write_table(df: pd.DataFrame, path: Path):
@@ -211,7 +237,16 @@ def load_data_for_district(district: str) -> pd.DataFrame:
 
     for c in NUM_COLS:
         if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
+            # Handles Excel-exported values such as "33.693833°", commas, and extra spaces.
+            cleaned = (
+                df[c]
+                .astype(str)
+                .str.replace("°", "", regex=False)
+                .str.replace(",", "", regex=False)
+                .str.strip()
+            )
+            cleaned = cleaned.replace({"nan": pd.NA, "None": pd.NA, "": pd.NA})
+            df[c] = pd.to_numeric(cleaned, errors="coerce")
 
     # 6) Fill static columns per dam
     df = df.sort_values(["Location", "Date"], na_position="last")
