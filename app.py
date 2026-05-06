@@ -128,11 +128,116 @@ ARROWS = {
     "No Data": "—",
 }
 
+# Standard dam names for Islamabad. This keeps the dashboard consistent even if
+# the source file uses lowercase, mixed case, extra spaces, or slight spelling variants.
+ISLAMABAD_DAM_NAMES = [
+    "RAWAL",
+    "KHASALA",
+    "Dhok Sandymar",
+    "JAWA",
+    "MISRIOT",
+    "SHAKADARA",
+    "SIPIALA",
+    "HAJI SHAH",
+    "TALIKINA",
+    "QIBLA BANDI",
+    "MUJAHID",
+    "CHAHAN",
+    "MAHOTA",
+]
+
+DAM_NAME_ALIASES = {
+    # Islamabad aliases / spelling corrections
+    "rawal": "RAWAL",
+    "rawal dam": "RAWAL",
+    "khasala": "KHASALA",
+    "khasla": "KHASALA",
+    "dhok sandymar": "Dhok Sandymar",
+    "dhok sanday mar": "Dhok Sandymar",
+    "dhok sandy mar": "Dhok Sandymar",
+    "dhok sandimar": "Dhok Sandymar",
+    "jawa": "JAWA",
+    "misriot": "MISRIOT",
+    "misriote": "MISRIOT",
+    "shakadara": "SHAKADARA",
+    "shakardara": "SHAKADARA",
+    "shakar dara": "SHAKADARA",
+    "sipiala": "SIPIALA",
+    "sipyala": "SIPIALA",
+    "haji shah": "HAJI SHAH",
+    "hajishah": "HAJI SHAH",
+    "talikina": "TALIKINA",
+    "talikna": "TALIKINA",
+    "talikena": "TALIKINA",
+    "qibla bandi": "QIBLA BANDI",
+    "qibla band": "QIBLA BANDI",
+    "qiblabandi": "QIBLA BANDI",
+    "mujahid": "MUJAHID",
+    "chahan": "CHAHAN",
+    "mahota": "MAHOTA",
+}
+
+
 # ──────────────────────── HELPERS ────────────────────────
 def _clean_header(s: str) -> str:
     s = str(s).replace('"', "")
     s = re.sub(r"\s+", " ", s).strip()
     return s
+
+
+def _name_key(name: str) -> str:
+    """Create a forgiving key for dam-name matching."""
+    key = str(name).strip().lower()
+    key = re.sub(r"[^a-z0-9]+", " ", key)
+    key = re.sub(r"\s+", " ", key).strip()
+    return key
+
+
+def normalize_location_name(name: str, district: str) -> str:
+    """Normalize dam names. Islamabad uses a fixed approved dam-name list."""
+    if pd.isna(name):
+        return ""
+
+    cleaned = re.sub(r"\s+", " ", str(name).strip())
+    if district == "Islamabad":
+        return DAM_NAME_ALIASES.get(_name_key(cleaned), cleaned.upper())
+
+    # Keep Talagang mostly as-is, only normalize spacing.
+    return cleaned
+
+
+def repair_dates(dates: pd.Series) -> pd.Series:
+    """
+    Parse D/M/Y dates and repair obvious spreadsheet typos where dates suddenly
+    jump far into future years. Example found in Islamabad CSV:
+    27/10/2026, 27/10/2027 ... 27/10/2037 should remain part of the 2025 daily series.
+    The function replaces far-future dates with the previous valid year while keeping day/month.
+    """
+    parsed = pd.to_datetime(dates, dayfirst=True, errors="coerce")
+    max_reasonable = pd.Timestamp(date.today() + timedelta(days=30))
+
+    repaired = []
+    last_valid = None
+    for value in parsed:
+        if pd.isna(value):
+            repaired.append(pd.NaT)
+            continue
+
+        value = pd.Timestamp(value)
+        if last_valid is not None and value > max_reasonable:
+            try:
+                value = value.replace(year=last_valid.year)
+            except ValueError:
+                pass
+
+        # If still unreasonable, treat as missing instead of letting it distort latest-date filters.
+        if value > max_reasonable:
+            repaired.append(pd.NaT)
+        else:
+            repaired.append(value)
+            last_valid = value
+
+    return pd.Series(repaired, index=dates.index).dt.date
 
 
 def resolve_source_path(district: str) -> Path:
@@ -231,9 +336,10 @@ def load_data_for_district(district: str) -> pd.DataFrame:
         st.stop()
 
     # 5) Parse dates and normalize text
-    df["Date"] = pd.to_datetime(df["Date"], dayfirst=True, errors="coerce").dt.date
-    df["Location"] = df["Location"].astype(str).str.strip()
-    df = df[df["Location"].notna() & (df["Location"].astype(str).str.lower() != "nan")]
+    df["Date"] = repair_dates(df["Date"])
+    df["Location"] = df["Location"].apply(lambda x: normalize_location_name(x, district))
+    df = df[df["Location"].notna() & (df["Location"].astype(str).str.strip() != "")]
+    df = df[df["Date"].notna()]
 
     for c in NUM_COLS:
         if c in df.columns:
@@ -525,7 +631,9 @@ with st.sidebar:
     if df.empty:
         st.warning("No dam records found in this district file. Add static rows in the CSV first.")
     else:
-        sel_loc = st.selectbox("Dam", sorted(df["Location"].dropna().unique()))
+        dam_options = ISLAMABAD_DAM_NAMES if selected_district == "Islamabad" else sorted(df["Location"].dropna().unique())
+        dam_options = [d for d in dam_options if d in set(df["Location"].dropna().unique())]
+        sel_loc = st.selectbox("Dam", dam_options)
         sel_date = st.date_input("Date", value=date.today(), key="entry_date")
 
         latest_val_series = df[df["Location"] == sel_loc].sort_values("Date")["Water_Level_ft"].dropna()
@@ -549,9 +657,11 @@ f1, f2, f3, f4 = st.columns([1.1, 1.2, 1, 1])
 with f1:
     _dates = pd.to_datetime(df["Date"], errors="coerce")
     default_day = _dates.dropna().max().date() if not _dates.dropna().empty else date.today()
-    show_date = st.date_input("Show date", value=default_day, key="show_date")
+    show_date = st.date_input("Show date", value=default_day, key=f"show_date_{selected_district}")
 with f2:
-    filt_locs = st.multiselect("Filter dams", sorted(df["Location"].dropna().unique()))
+    filter_dam_options = ISLAMABAD_DAM_NAMES if selected_district == "Islamabad" else sorted(df["Location"].dropna().unique())
+    filter_dam_options = [d for d in filter_dam_options if d in set(df["Location"].dropna().unique())]
+    filt_locs = st.multiselect("Filter dams", filter_dam_options)
 with f3:
     status_filter = st.multiselect("Filter status", sorted(df["Status"].dropna().unique()))
 with f4:
@@ -562,6 +672,13 @@ if only_latest:
     view = latest_per_dam(view)
 else:
     view = view[view["Date"] == show_date]
+    if view.empty:
+        latest_available = df["Date"].dropna().max()
+        if pd.notna(latest_available):
+            st.warning(
+                f"No readings found for {show_date}. Showing latest available date instead: {latest_available}."
+            )
+            view = df[df["Date"] == latest_available]
 
 if filt_locs:
     view = view[view["Location"].isin(filt_locs)]
